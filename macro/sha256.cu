@@ -1,5 +1,15 @@
 #include "./sha256.cuh"
 #include <iostream>
+#include <cstdio>   
+#include <cstdlib>  
+
+#define CUDA_CHECK(err) { \
+    cudaError_t error = err; \
+    if (error != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(error), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
 
 #define ROTR(a,b) (((a) >> (b)) | ((a) << (32-(b))))
 
@@ -30,21 +40,16 @@ __global__ void sha256_gpu_kernel_optimized(const uint8_t* __restrict__ input_ch
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_chunks) return;
 
-    __shared__ uint32_t shared_chunk[16];
     const uint8_t* global_chunk_ptr = &input_chunks[idx * 64];
-
-    if (threadIdx.x < 16) {
-        uint32_t word = (uint32_t)global_chunk_ptr[threadIdx.x * 4] << 24 |
-                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 1] << 16 |
-                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 2] << 8 |
-                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 3];
-        shared_chunk[threadIdx.x] = word;
-    }
-    __syncthreads();
-
     uint32_t w[64];
+
     #pragma unroll
-    for (int t = 0; t < 16; ++t) w[t] = shared_chunk[t];
+    for (int t = 0; t < 16; ++t) {
+        w[t] = ( (uint32_t)global_chunk_ptr[t*4] << 24 ) |
+               ( (uint32_t)global_chunk_ptr[t*4+1] << 16 ) |
+               ( (uint32_t)global_chunk_ptr[t*4+2] << 8 ) |
+               ( (uint32_t)global_chunk_ptr[t*4+3] );
+    }
     
     #pragma unroll
     for (int t = 16; t < 64; ++t) w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
@@ -75,17 +80,18 @@ float run_sha256_batch(const uint8_t* input_chunks, uint32_t* output_hashes, int
     uint32_t* d_output;
     size_t input_size = num_chunks * 64 * sizeof(uint8_t);
     size_t output_size = num_chunks * 8 * sizeof(uint32_t);
-    cudaMalloc(&d_input, input_size);
-    cudaMalloc(&d_output, output_size);
+    
+    CUDA_CHECK(cudaMalloc(&d_input, input_size));
+    CUDA_CHECK(cudaMalloc(&d_output, output_size));
 
     cudaStream_t streams[NUM_STREAMS];
-    for (int i = 0; i < NUM_STREAMS; ++i) cudaStreamCreate(&streams[i]);
+    for (int i = 0; i < NUM_STREAMS; ++i) CUDA_CHECK(cudaStreamCreate(&streams[i]));
 
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
-    cudaEventRecord(start);
+    CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < NUM_STREAMS; ++i) {
         int offset = i * BATCH_SIZE;
         if (offset >= num_chunks) break;
@@ -98,27 +104,27 @@ float run_sha256_batch(const uint8_t* input_chunks, uint32_t* output_hashes, int
         size_t batch_input_bytes = current_batch_size * 64 * sizeof(uint8_t);
         size_t batch_output_bytes = current_batch_size * 8 * sizeof(uint32_t);
 
-        cudaMemcpyAsync(&d_input[offset * 64], &input_chunks[offset * 64], batch_input_bytes, cudaMemcpyHostToDevice, streams[i]);
+        CUDA_CHECK(cudaMemcpyAsync(&d_input[offset * 64], &input_chunks[offset * 64], batch_input_bytes, cudaMemcpyHostToDevice, streams[i]));
         
         int threads_per_block = 256;
         int blocks_per_grid = (current_batch_size + threads_per_block - 1) / threads_per_block;
         sha256_gpu_kernel_optimized<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>
             (&d_input[offset * 64], &d_output[offset * 8], current_batch_size);
+        CUDA_CHECK(cudaGetLastError()); 
 
-        cudaMemcpyAsync(&output_hashes[offset * 8], &d_output[offset * 8], batch_output_bytes, cudaMemcpyDeviceToHost, streams[i]);
+        CUDA_CHECK(cudaMemcpyAsync(&output_hashes[offset * 8], &d_output[offset * 8], batch_output_bytes, cudaMemcpyDeviceToHost, streams[i]));
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
 
-    // Pembersihan
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    for (int i = 0; i < NUM_STREAMS; ++i) cudaStreamDestroy(streams[i]);
-    cudaFree(d_input);
-    cudaFree(d_output);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    for (int i = 0; i < NUM_STREAMS; ++i) CUDA_CHECK(cudaStreamDestroy(streams[i]);
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
 
     return milliseconds;
 }
