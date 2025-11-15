@@ -16,11 +16,11 @@
  * 
  * 
  * 
- * @param input_chunks 
- * @param output_hashes 
- * @param num_chunks 
- * @return 
+ * 
+ * 
+ * 
+ * 
  */
-float run_sha256_batch(const uint8_t* input_chunks, uint32_t* output_hashes, int num_chunks);
+void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_output);
 
 #endif // SHA256_CUH

@@ -1,5 +1,17 @@
 #include "./sha256.cuh"
 #include <iostream>
+#include <vector>
+#include <stdexcept>
+#include <cstring> 
+
+
+#define CUDA_CHECK(err) { \
+    cudaError_t error = err; \
+    if (error != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(error), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
 
 #define ROTR(a,b) (((a) >> (b)) | ((a) << (32-(b))))
 
@@ -26,20 +38,25 @@ __device__ uint32_t Sigma1(uint32_t x) { return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(
 __device__ uint32_t sigma0(uint32_t x) { return ROTR(x, 7) ^ ROTR(x, 18) ^ (x >> 3); }
 __device__ uint32_t sigma1(uint32_t x) { return ROTR(x, 17) ^ ROTR(x, 19) ^ (x >> 10); }
 
-__global__ void sha256_gpu_kernel_optimized(const uint8_t* __restrict__ input_chunks, uint32_t* __restrict__ output_hashes, int num_chunks) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_chunks) return;
-
-    const uint8_t* global_chunk_ptr = &input_chunks[idx * 64];
-
+/**
+ * @brief 
+ * 
+ * 
+ * 
+ * 
+ * @param data_chunk 
+ * @param current_hash_state 
+ */
+__global__ void sha256_gpu_kernel_compression(const uint8_t* __restrict__ data_chunk, uint32_t* __restrict__ current_hash_state) { 
     uint32_t w[64];
     
     #pragma unroll
     for (int t = 0; t < 16; ++t) {
-        w[t] = (uint32_t)global_chunk_ptr[t * 4] << 24 |
-               (uint32_t)global_chunk_ptr[t * 4 + 1] << 16 |
-               (uint32_t)global_chunk_ptr[t * 4 + 2] << 8 |
-               (uint32_t)global_chunk_ptr[t * 4 + 3];
+        
+        w[t] = (uint32_t)data_chunk[t * 4] << 24 |
+               (uint32_t)data_chunk[t * 4 + 1] << 16 |
+               (uint32_t)data_chunk[t * 4 + 2] << 8 |
+               (uint32_t)data_chunk[t * 4 + 3];
     }
     
     #pragma unroll
@@ -47,8 +64,9 @@ __global__ void sha256_gpu_kernel_optimized(const uint8_t* __restrict__ input_ch
         w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
     }
 
-    uint32_t a = initial_h[0], b = initial_h[1], c = initial_h[2], d = initial_h[3];
-    uint32_t e = initial_h[4], f = initial_h[5], g = initial_h[6], h_val = initial_h[7];
+    
+    uint32_t a = current_hash_state[0], b = current_hash_state[1], c = current_hash_state[2], d = current_hash_state[3];
+    uint32_t e = current_hash_state[4], f = current_hash_state[5], g = current_hash_state[6], h_val = current_hash_state[7];
 
     #pragma unroll
     for (int t = 0; t < 64; ++t) {
@@ -58,65 +76,50 @@ __global__ void sha256_gpu_kernel_optimized(const uint8_t* __restrict__ input_ch
         d = c; c = b; b = a; a = t1 + t2;
     }
 
-    uint32_t* out_ptr = &output_hashes[idx * 8];
-    out_ptr[0] = a + initial_h[0]; out_ptr[1] = b + initial_h[1];
-    out_ptr[2] = c + initial_h[2]; out_ptr[3] = d + initial_h[3];
-    out_ptr[4] = e + initial_h[4]; out_ptr[5] = f + initial_h[5];
-    out_ptr[6] = g + initial_h[6]; out_ptr[7] = h_val + initial_h[7];
+    
+    current_hash_state[0] += a; current_hash_state[1] += b;
+    current_hash_state[2] += c; current_hash_state[3] += d;
+    current_hash_state[4] += e; current_hash_state[5] += f;
+    current_hash_state[6] += g; current_hash_state[7] += h_val;
 }
 
-float run_sha256_batch(const uint8_t* input_chunks, uint32_t* output_hashes, int num_chunks) {
-    const int NUM_STREAMS = 4;
-    const int BATCH_SIZE = (num_chunks + NUM_STREAMS - 1) / NUM_STREAMS;
-
-    uint8_t* d_input;
-    uint32_t* d_output;
-    size_t input_size = num_chunks * 64 * sizeof(uint8_t);
-    size_t output_size = num_chunks * 8 * sizeof(uint32_t);
-    cudaMalloc(&d_input, input_size);
-    cudaMalloc(&d_output, output_size);
-
-    cudaStream_t streams[NUM_STREAMS];
-    for (int i = 0; i < NUM_STREAMS; ++i) cudaStreamCreate(&streams[i]);
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    cudaEventRecord(start);
-    for (int i = 0; i < NUM_STREAMS; ++i) {
-        int offset = i * BATCH_SIZE;
-        if (offset >= num_chunks) break;
-        
-        int current_batch_size = BATCH_SIZE;
-        if (offset + BATCH_SIZE > num_chunks) {
-            current_batch_size = num_chunks - offset;
-        }
-
-        size_t batch_input_bytes = current_batch_size * 64 * sizeof(uint8_t);
-        size_t batch_output_bytes = current_batch_size * 8 * sizeof(uint32_t);
-
-        cudaMemcpyAsync(&d_input[offset * 64], &input_chunks[offset * 64], batch_input_bytes, cudaMemcpyHostToDevice, streams[i]);
-        
-        int threads_per_block = 256;
-        int blocks_per_grid = (current_batch_size + threads_per_block - 1) / threads_per_block;
-        sha256_gpu_kernel_optimized<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>
-            (&d_input[offset * 64], &d_output[offset * 8], current_batch_size);
-
-        cudaMemcpyAsync(&output_hashes[offset * 8], &d_output[offset * 8], batch_output_bytes, cudaMemcpyDeviceToHost, streams[i]);
+void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_output) {
+    if (message == nullptr || hash_output == nullptr) {
+        throw std::invalid_argument("Input pointers cannot be null.");
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
 
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    
+    size_t num_blocks = (message_len + 8 + 63) / 64; 
+    std::vector<uint8_t> padded_message(num_blocks * 64, 0);
 
-    // Pembersihan
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    for (int i = 0; i < NUM_STREAMS; ++i) cudaStreamDestroy(streams[i]);
-    cudaFree(d_input);
-    cudaFree(d_output);
+    memcpy(padded_message.data(), message, message_len);
 
-    return milliseconds;
+    padded_message[message_len] = 0x80;
+
+    uint64_t message_len_bits = (uint64_t)message_len * 8;
+    for (int i = 0; i < 8; ++i) {
+        padded_message[num_blocks * 64 - 8 + i] = (message_len_bits >> (56 - 8 * i)) & 0xFF;
+    }
+
+    uint8_t* d_chunk;
+    uint32_t* d_hash_state;
+    CUDA_CHECK(cudaMalloc(&d_chunk, 64 * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&d_hash_state, 8 * sizeof(uint32_t)));
+
+    CUDA_CHECK(cudaMemcpy(d_hash_state, initial_h, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        
+        CUDA_CHECK(cudaMemcpy(d_chunk, &padded_message[i * 64], 64 * sizeof(uint8_t), cudaMemcpyHostToDevice));
+        
+        sha256_gpu_kernel_compression<<<1, 1>>>(d_chunk, d_hash_state);
+        
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    CUDA_CHECK(cudaMemcpy(hash_output, d_hash_state, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_chunk));
+    CUDA_CHECK(cudaFree(d_hash_state));
 }
