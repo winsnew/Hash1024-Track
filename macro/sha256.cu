@@ -47,12 +47,11 @@ __device__ uint32_t sigma1(uint32_t x) { return ROTR(x, 17) ^ ROTR(x, 19) ^ (x >
  * @param data_chunk 
  * @param current_hash_state 
  */
-__global__ void sha256_gpu_kernel_compression(const uint8_t* __restrict__ data_chunk, uint32_t* __restrict__ current_hash_state) { 
+__global__ void sha256_gpu_kernel_compression(const uint8_t* __restrict__ data_chunk, uint32_t* __restrict__ current_hash_state) {
     uint32_t w[64];
     
     #pragma unroll
     for (int t = 0; t < 16; ++t) {
-        
         w[t] = (uint32_t)data_chunk[t * 4] << 24 |
                (uint32_t)data_chunk[t * 4 + 1] << 16 |
                (uint32_t)data_chunk[t * 4 + 2] << 8 |
@@ -64,7 +63,6 @@ __global__ void sha256_gpu_kernel_compression(const uint8_t* __restrict__ data_c
         w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
     }
 
-    
     uint32_t a = current_hash_state[0], b = current_hash_state[1], c = current_hash_state[2], d = current_hash_state[3];
     uint32_t e = current_hash_state[4], f = current_hash_state[5], g = current_hash_state[6], h_val = current_hash_state[7];
 
@@ -76,7 +74,6 @@ __global__ void sha256_gpu_kernel_compression(const uint8_t* __restrict__ data_c
         d = c; c = b; b = a; a = t1 + t2;
     }
 
-    
     current_hash_state[0] += a; current_hash_state[1] += b;
     current_hash_state[2] += c; current_hash_state[3] += d;
     current_hash_state[4] += e; current_hash_state[5] += f;
@@ -88,12 +85,9 @@ void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_outpu
         throw std::invalid_argument("Input pointers cannot be null.");
     }
 
-    
-    size_t num_blocks = (message_len + 8 + 63) / 64; 
+    size_t num_blocks = (message_len + 8 + 63) / 64;
     std::vector<uint8_t> padded_message(num_blocks * 64, 0);
-
     memcpy(padded_message.data(), message, message_len);
-
     padded_message[message_len] = 0x80;
 
     uint64_t message_len_bits = (uint64_t)message_len * 8;
@@ -109,17 +103,13 @@ void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_outpu
     CUDA_CHECK(cudaMemcpy(d_hash_state, initial_h, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
     for (size_t i = 0; i < num_blocks; ++i) {
-        
         CUDA_CHECK(cudaMemcpy(d_chunk, &padded_message[i * 64], 64 * sizeof(uint8_t), cudaMemcpyHostToDevice));
-        
         sha256_gpu_kernel_compression<<<1, 1>>>(d_chunk, d_hash_state);
-        
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     CUDA_CHECK(cudaMemcpy(hash_output, d_hash_state, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
     CUDA_CHECK(cudaFree(d_chunk));
     CUDA_CHECK(cudaFree(d_hash_state));
 }
