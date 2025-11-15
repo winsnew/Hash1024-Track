@@ -26,7 +26,7 @@ std::vector<uint8_t> sha256_pad_message(const std::string& message) {
 }
 
 int main() {
-    std::string input_str = "abc";
+    std::string input_str = "bf7413e8df4d039a6800aaf48383c0d75d596879";
     std::vector<uint8_t> padded_input = sha256_pad_message(input_str);
     int num_chunks = padded_input.size() / 64;
     std::vector<uint32_t> output_hashes(num_chunks * 8);
