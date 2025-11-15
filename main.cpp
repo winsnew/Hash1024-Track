@@ -1,73 +1,47 @@
 #include <iostream>
-#include <vector>
 #include <iomanip>
 #include <string>
-#include <cstdint>
-#include <openssl/sha.h> 
+#include <vector>
 
 #include "macro/sha256.cuh"
 
-void print_hash(const uint32_t* hash) {
-    std::cout << std::hex << std::setfill('0');
+
+void sha256_pad_single_block(const std::string& message, uint8_t* padded_block) {
+    memset(padded_block, 0, 64);
+    size_t msg_len = message.length();
+    memcpy(padded_block, message.c_str(), msg_len);
+    padded_block[msg_len] = 0x80;
+    uint64_t msg_bits_len = static_cast<uint64_t>(msg_len) * 8;
     for (int i = 0; i < 8; ++i) {
-        std::cout << std::setw(8) << hash[i];
+        padded_block[56 + i] = (msg_bits_len >> (56 - 8 * i)) & 0xFF;
+    }
+}
+
+void print_hash(const uint32_t* hash) {
+    for (int i = 0; i < 8; ++i) {
+        std::cout << std::hex << std::setw(8) << std::setfill('0') << hash[i];
     }
     std::cout << std::dec << std::endl; 
 }
 
 int main() {
-    // ==========================================================
-    // 1. UJI KEBENARAN (VERIFICATION TEST)
-    // ==========================================================
-    std::cout << "--- Verification Test ---" << std::endl;
-
-    std::vector<uint8_t> test_input_padded = {
-        0x61, 0x62, 0x63, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18
-    };
+    std::string input_str = "abc";
     
-    std::vector<uint32_t> gpu_hash_output(8);
+    std::vector<uint8_t> padded_data(64);
+    
+    sha256_pad_single_block(input_str, padded_data.data());
 
-    run_sha256_batch(test_input_padded.data(), gpu_hash_output.data(), 1);
+    std::vector<uint32_t> output_hash(8);
 
-    std::cout << "Input string: \"abc\"" << std::endl;
+    std::cout << "Running GPU for SHA-256(\"" << input_str << "\")..." << std::endl;
+    float time_ms = run_sha256_batch(padded_data.data(), output_hash.data(), 1);
+    
     std::cout << "GPU Hash     : ";
-    print_hash(gpu_hash_output.data());
-
-    std::string correct_hash_str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    std::cout << "Correct Hash : " << correct_hash_str << std::endl;
-
-    std::cout << "\nVerifikasi: ";
+    print_hash(output_hash.data());
     
-    std::cout << "Diketahui GAGAL karena bug pada fungsi sigma1." << std::endl;
-
-
-    // ==========================================================
-    // 2. UJI PERFORMA (PERFORMANCE TEST)
-    // ==========================================================
-    std::cout << "\n--- Performance Test ---" << std::endl;
-
-    const int NUM_CHUNKS_PERFORMANCE = 2000000; 
-    std::cout << "Menghitung " << NUM_CHUNKS_PERFORMANCE << " hashes..." << std::endl;
-
-    std::vector<uint8_t> h_input_perf(NUM_CHUNKS_PERFORMANCE * 64);
-    std::vector<uint32_t> h_output_perf(NUM_CHUNKS_PERFORMANCE * 8);
-
-    for (size_t i = 0; i < h_input_perf.size(); ++i) {
-        h_input_perf[i] = static_cast<uint8_t>(i % 256);
-    }
-
-    float time_ms = run_sha256_batch(h_input_perf.data(), h_output_perf.data(), NUM_CHUNKS_PERFORMANCE);
-
-    double time_sec = time_ms / 1000.0;
-    double hashes_per_sec = static_cast<double>(NUM_CHUNKS_PERFORMANCE) / time_sec;
-    double mega_hashes_per_sec = hashes_per_sec / 1e6;
-
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Waktu Eksekusi (GPU Kernel + Mem Transfer): " << time_ms << " ms" << std::endl;
-    std::cout << "Kecepatan: " << mega_hashes_per_sec << " MH/s" << std::endl;
+    std::cout << "Expected Hash: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" << std::endl;
+    
+    std::cout << "Execution time: " << time_ms << " ms" << std::endl;
 
     return 0;
 }
