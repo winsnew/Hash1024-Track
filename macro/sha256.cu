@@ -122,7 +122,7 @@ float run_sha256_batch(const uint8_t* input_chunks, uint32_t* output_hashes, int
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    for (int i = 0; i < NUM_STREAMS; ++i) CUDA_CHECK(cudaStreamDestroy(streams[i]);
+    for (int i = 0; i < NUM_STREAMS; ++i) CUDA_CHECK(cudaStreamDestroy(streams[i]));
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_output));
 
