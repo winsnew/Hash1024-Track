@@ -30,24 +30,22 @@ __global__ void sha256_gpu_kernel_optimized(const uint8_t* __restrict__ input_ch
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_chunks) return;
 
-    __shared__ uint32_t shared_chunk[16];
     const uint8_t* global_chunk_ptr = &input_chunks[idx * 64];
 
-    if (threadIdx.x < 16) {
-        uint32_t word = (uint32_t)global_chunk_ptr[threadIdx.x * 4] << 24 |
-                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 1] << 16 |
-                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 2] << 8 |
-                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 3];
-        shared_chunk[threadIdx.x] = word;
-    }
-    __syncthreads();
-
     uint32_t w[64];
-    #pragma unroll
-    for (int t = 0; t < 16; ++t) w[t] = shared_chunk[t];
     
     #pragma unroll
-    for (int t = 16; t < 64; ++t) w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
+    for (int t = 0; t < 16; ++t) {
+        w[t] = (uint32_t)global_chunk_ptr[t * 4] << 24 |
+               (uint32_t)global_chunk_ptr[t * 4 + 1] << 16 |
+               (uint32_t)global_chunk_ptr[t * 4 + 2] << 8 |
+               (uint32_t)global_chunk_ptr[t * 4 + 3];
+    }
+    
+    #pragma unroll
+    for (int t = 16; t < 64; ++t) {
+        w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
+    }
 
     uint32_t a = initial_h[0], b = initial_h[1], c = initial_h[2], d = initial_h[3];
     uint32_t e = initial_h[4], f = initial_h[5], g = initial_h[6], h_val = initial_h[7];
