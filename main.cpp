@@ -2,6 +2,8 @@
 #include <iomanip>
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <cstring>
 
 #include "macro/sha256.cuh"
 
