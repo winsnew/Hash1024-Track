@@ -2,7 +2,7 @@
 #include <iomanip>
 #include <string>
 #include <vector>
-#include "sha256.cuh"
+#include "macro/sha256.cuh"
 
 void print_hash(const uint32_t* hash) {
     std::cout << std::hex << std::setfill('0');
