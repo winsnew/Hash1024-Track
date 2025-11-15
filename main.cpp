@@ -20,7 +20,7 @@ void sha256_pad_single_block(const uint8_t* message, size_t message_len, uint8_t
 }
 
 int main() {
-    const char* message_str = "abc";
+    const char* message_str = "0390f24331aec7341074cd4058dc69c686fb638cd041e0aa479f78f4fed8058700";
     size_t message_len = strlen(message_str);
 
     std::vector<uint8_t> input_padded(64);
@@ -37,7 +37,7 @@ int main() {
     }
     std::cout << std::endl;
     
-    const char* expected_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const char* expected_hash = "17969b7d1bdd29f9413adefeaac697eb219817c328afd94037bf2faf96e90f4c";
     std::cout << "Expected Hash: " << expected_hash << std::endl;
     std::cout << "Time: " << time << " ms" << std::endl;
 
