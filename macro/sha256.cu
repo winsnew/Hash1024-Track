@@ -1,7 +1,5 @@
 #include "./sha256.cuh"
 #include <iostream>
-#include <vector>
-#include <cstring> 
 
 #define ROTR(a,b) (((a) >> (b)) | ((a) << (32-(b))))
 
@@ -25,163 +23,102 @@ __device__ uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~
 __device__ uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
 __device__ uint32_t Sigma0(uint32_t x) { return ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22); }
 __device__ uint32_t Sigma1(uint32_t x) { return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25); }
-__device__ uint32_t sigma0(uint32_t x) { return ROTR(x, 7) ^ ROTR(x, 18) & (x >> 3); }
+__device__ uint32_t sigma0(uint32_t x) { return ROTR(x, 7) ^ ROTR(x, 18) ^ (x >> 3); }
 __device__ uint32_t sigma1(uint32_t x) { return ROTR(x, 17) ^ ROTR(x, 19) ^ (x >> 10); }
 
-
-__global__ void sha256_gpu_kernel_long_messages_shared(
-    const uint8_t* __restrict__ padded_chunks,
-    const uint32_t* __restrict__ chunk_offsets,
-    const uint32_t* __restrict__ chunks_per_message,
-    uint32_t* __restrict__ output_hashes,
-    int num_messages)
-{
+__global__ void sha256_gpu_kernel_optimized(const uint8_t* __restrict__ input_chunks, uint32_t* __restrict__ output_hashes, int num_chunks) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_messages) return;
+    if (idx >= num_chunks) return;
 
-    
     __shared__ uint32_t shared_chunk[16];
+    const uint8_t* global_chunk_ptr = &input_chunks[idx * 64];
 
-    uint32_t offset = chunk_offsets[idx];
-    uint32_t num_my_chunks = chunks_per_message[idx];
-    const uint8_t* my_chunk_ptr = &padded_chunks[offset * 64];
-
-    uint32_t h[8];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        h[i] = initial_h[i];
+    if (threadIdx.x < 16) {
+        uint32_t word = (uint32_t)global_chunk_ptr[threadIdx.x * 4] << 24 |
+                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 1] << 16 |
+                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 2] << 8 |
+                        (uint32_t)global_chunk_ptr[threadIdx.x * 4 + 3];
+        shared_chunk[threadIdx.x] = word;
     }
+    __syncthreads();
 
-    for (uint32_t c = 0; c < num_my_chunks; ++c) {        
-        if (threadIdx.x < 16) {
-            const uint8_t* chunk_data_ptr = my_chunk_ptr + c * 64;
-            shared_chunk[threadIdx.x] = (uint32_t)chunk_data_ptr[threadIdx.x * 4] << 24 |
-                                        (uint32_t)chunk_data_ptr[threadIdx.x * 4 + 1] << 16 |
-                                        (uint32_t)chunk_data_ptr[threadIdx.x * 4 + 2] << 8 |
-                                        (uint32_t)chunk_data_ptr[threadIdx.x * 4 + 3];
-        }
-        
-        __syncthreads();
+    uint32_t w[64];
+    #pragma unroll
+    for (int t = 0; t < 16; ++t) w[t] = shared_chunk[t];
+    
+    #pragma unroll
+    for (int t = 16; t < 64; ++t) w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
 
+    uint32_t a = initial_h[0], b = initial_h[1], c = initial_h[2], d = initial_h[3];
+    uint32_t e = initial_h[4], f = initial_h[5], g = initial_h[6], h_val = initial_h[7];
 
-        uint32_t w[64];
-        #pragma unroll
-        for (int t = 0; t < 16; ++t) {
-            w[t] = shared_chunk[t];
-        }
-
-        #pragma unroll
-        for (int t = 16; t < 64; ++t) {
-            w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
-        }
-
-        uint32_t a = h[0], b = h[1], c_var = h[2], d = h[3];
-        uint32_t e = h[4], f = h[5], g = h[6], h_val = h[7];
-
-        #pragma unroll
-        for (int t = 0; t < 64; ++t) {
-            uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[t] + w[t];
-            uint32_t t2 = Sigma0(a) + Maj(a, b, c_var);
-            h_val = g; g = f; f = e; e = d + t1;
-            d = c_var; c_var = b; b = a; a = t1 + t2;
-        }
-
-        h[0] += a; h[1] += b; h[2] += c_var; h[3] += d;
-        h[4] += e; h[5] += f; h[6] += g; h[7] += h_val;
-
-        __syncthreads();
+    #pragma unroll
+    for (int t = 0; t < 64; ++t) {
+        uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[t] + w[t];
+        uint32_t t2 = Sigma0(a) + Maj(a, b, c);
+        h_val = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
     }
 
     uint32_t* out_ptr = &output_hashes[idx * 8];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        out_ptr[i] = h[i];
-    }
+    out_ptr[0] = a + initial_h[0]; out_ptr[1] = b + initial_h[1];
+    out_ptr[2] = c + initial_h[2]; out_ptr[3] = d + initial_h[3];
+    out_ptr[4] = e + initial_h[4]; out_ptr[5] = f + initial_h[5];
+    out_ptr[6] = g + initial_h[6]; out_ptr[7] = h_val + initial_h[7];
 }
 
+float run_sha256_batch(const uint8_t* input_chunks, uint32_t* output_hashes, int num_chunks) {
+    const int NUM_STREAMS = 4;
+    const int BATCH_SIZE = (num_chunks + NUM_STREAMS - 1) / NUM_STREAMS;
 
-std::vector<uint8_t> pad_message(const uint8_t* message, size_t len) {
-    size_t new_len = len + 1 + 8; 
-    size_t num_chunks = (new_len + 63) / 64; 
-    size_t padded_len = num_chunks * 64;
+    uint8_t* d_input;
+    uint32_t* d_output;
+    size_t input_size = num_chunks * 64 * sizeof(uint8_t);
+    size_t output_size = num_chunks * 8 * sizeof(uint32_t);
+    cudaMalloc(&d_input, input_size);
+    cudaMalloc(&d_output, output_size);
 
-    std::vector<uint8_t> padded(padded_len, 0);
-    if (len > 0) {
-        memcpy(padded.data(), message, len);
-    }
-
-    padded[len] = 0x80; 
-
-    uint64_t bit_len = len * 8;
-    for (int i = 0; i < 8; ++i) {
-        padded[padded_len - 8 + i] = (bit_len >> (56 - i * 8)) & 0xFF;
-    }
-
-    return padded;
-}
-
-
-float run_sha256_batch_long_messages(
-    const uint8_t* messages,
-    const size_t* message_lengths,
-    int num_messages,
-    uint32_t* output_hashes)
-{
-    std::vector<uint32_t> chunks_per_message(num_messages);
-    std::vector<uint32_t> chunk_offsets(num_messages);
-    std::vector<uint8_t> all_padded_chunks;
-    size_t total_chunks = 0;
-
-    for (int i = 0; i < num_messages; ++i) {
-        std::vector<uint8_t> padded = pad_message(messages + (i > 0 ? message_lengths[i-1] : 0), message_lengths[i]);
-        chunks_per_message[i] = padded.size() / 64;
-        chunk_offsets[i] = total_chunks;
-        total_chunks += chunks_per_message[i];
-        all_padded_chunks.insert(all_padded_chunks.end(), padded.begin(), padded.end());
-    }
-
-    uint8_t* d_padded_chunks;
-    uint32_t* d_chunks_per_message;
-    uint32_t* d_chunk_offsets;
-    uint32_t* d_output_hashes;
-
-    size_t padded_data_size = total_chunks * 64 * sizeof(uint8_t);
-    size_t chunk_meta_size = num_messages * sizeof(uint32_t);
-    size_t output_size = num_messages * 8 * sizeof(uint32_t);
-
-    cudaMalloc(&d_padded_chunks, padded_data_size);
-    cudaMalloc(&d_chunks_per_message, chunk_meta_size);
-    cudaMalloc(&d_chunk_offsets, chunk_meta_size);
-    cudaMalloc(&d_output_hashes, output_size);
-
-    cudaMemcpy(d_padded_chunks, all_padded_chunks.data(), padded_data_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_chunks_per_message, chunks_per_message.data(), chunk_meta_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_chunk_offsets, chunk_offsets.data(), chunk_meta_size, cudaMemcpyHostToDevice);
+    cudaStream_t streams[NUM_STREAMS];
+    for (int i = 0; i < NUM_STREAMS; ++i) cudaStreamCreate(&streams[i]);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    int threads_per_block = 256; 
-    int blocks_per_grid = (num_messages + threads_per_block - 1) / threads_per_block;
-
     cudaEventRecord(start);
-    sha256_gpu_kernel_long_messages_shared<<<blocks_per_grid, threads_per_block>>>(
-        d_padded_chunks, d_chunk_offsets, d_chunks_per_message, d_output_hashes, num_messages);
-    cudaEventRecord(stop);
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        int offset = i * BATCH_SIZE;
+        if (offset >= num_chunks) break;
+        
+        int current_batch_size = BATCH_SIZE;
+        if (offset + BATCH_SIZE > num_chunks) {
+            current_batch_size = num_chunks - offset;
+        }
 
+        size_t batch_input_bytes = current_batch_size * 64 * sizeof(uint8_t);
+        size_t batch_output_bytes = current_batch_size * 8 * sizeof(uint32_t);
+
+        cudaMemcpyAsync(&d_input[offset * 64], &input_chunks[offset * 64], batch_input_bytes, cudaMemcpyHostToDevice, streams[i]);
+        
+        int threads_per_block = 256;
+        int blocks_per_grid = (current_batch_size + threads_per_block - 1) / threads_per_block;
+        sha256_gpu_kernel_optimized<<<blocks_per_grid, threads_per_block, 0, streams[i]>>>
+            (&d_input[offset * 64], &d_output[offset * 8], current_batch_size);
+
+        cudaMemcpyAsync(&output_hashes[offset * 8], &d_output[offset * 8], batch_output_bytes, cudaMemcpyDeviceToHost, streams[i]);
+    }
+    cudaEventRecord(stop);
     cudaEventSynchronize(stop);
+
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
 
-    cudaMemcpy(output_hashes, d_output_hashes, output_size, cudaMemcpyDeviceToHost);
-
+    // Pembersihan
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    cudaFree(d_padded_chunks);
-    cudaFree(d_chunks_per_message);
-    cudaFree(d_chunk_offsets);
-    cudaFree(d_output_hashes);
+    for (int i = 0; i < NUM_STREAMS; ++i) cudaStreamDestroy(streams[i]);
+    cudaFree(d_input);
+    cudaFree(d_output);
 
     return milliseconds;
 }
