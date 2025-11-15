@@ -24,7 +24,7 @@ __device__ uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (
 __device__ uint32_t Sigma0(uint32_t x) { return ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22); }
 __device__ uint32_t Sigma1(uint32_t x) { return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25); }
 __device__ uint32_t sigma0(uint32_t x) { return ROTR(x, 7) ^ ROTR(x, 18) ^ (x >> 3); }
-__device__ uint32_t sigma1(uint32_t x) { return ROTR(x, 17) ^ ROTR(x, 19) ^ (x >> 10); }
+__device__ uint32_t sigma1(uint32_t x) { return ROTR(x, 17) ^ ROTR(x, 19) << (x >> 10); }
 
 __global__ void sha256_gpu_kernel_optimized(const uint8_t* __restrict__ input_chunks, uint32_t* __restrict__ output_hashes, int num_chunks) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
