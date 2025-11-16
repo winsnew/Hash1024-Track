@@ -79,7 +79,6 @@ __global__ void sha256_extreme_batch_kernel(
     
     if (warp_id >= num_messages) return;
     
-    // Shared memory untuk komunikasi within warp
     __shared__ uint32_t shared_w[64 * 32];
     __shared__ uint32_t shared_state[8 * 32];
     
@@ -88,14 +87,12 @@ __global__ void sha256_extreme_batch_kernel(
     
     const uint8_t* my_message = messages + (warp_id * message_len);
     
-    // Initialize state (hanya thread 0-7 yang menulis)
     if (lane_id < 8) {
         warp_state[lane_id] = initial_h[lane_id];
     }
     
     size_t num_blocks = (message_len + 8 + 63) / 64;
     
-    // Process each block
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         const uint8_t* block_data = my_message + (block_idx * 64);
         size_t bytes_in_block = (block_idx == num_blocks - 1) ? 
@@ -397,7 +394,7 @@ void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_outpu
 }
 
 SHA256GPU::SHA256GPU(size_t max_batch) : max_batch_size(max_batch) {
-    CUDA_CHECK(cudaMalloc(&d_messages, max_batch_size * 64));
+    CUDA_CHECK(cudaMalloc(&d_messages, max_batch_size * 128));
     CUDA_CHECK(cudaMalloc(&d_hashes, max_batch_size * 8 * sizeof(uint32_t)));
     CUDA_CHECK(cudaStreamCreate(&stream));
 }
