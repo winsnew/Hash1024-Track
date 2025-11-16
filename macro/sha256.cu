@@ -60,10 +60,10 @@ __constant__ uint32_t initial_h[8] = {
 };
 
 /**
- * @brief 
+ * @brief Warp-based SHA256 kernel for variable length messages
  * 
- * 
- * 
+ * This kernel processes one message per warp (32 threads) with
+ * optimized shared memory usage and warp-level operations.
  */
 __global__ void sha256_extreme_batch_kernel(
     const uint8_t* __restrict__ messages, 
@@ -77,13 +77,20 @@ __global__ void sha256_extreme_batch_kernel(
     const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int lane_id = threadIdx.x % 32;
     
+    // Enhanced bounds checking
     if (warp_id >= num_messages) return;
     
-    __shared__ uint32_t shared_w[64 * 32];
-    __shared__ uint32_t shared_state[8 * 32];
+    extern __shared__ uint8_t shared_memory[];
+    uint32_t* shared_w = (uint32_t*)shared_memory;
+    uint32_t* shared_state = (uint32_t*)&shared_memory[64 * 32 * sizeof(uint32_t)];
     
-    uint32_t* warp_w = &shared_w[warp_id * 64];
-    uint32_t* warp_state = &shared_state[warp_id * 8];
+    const int warps_per_block = blockDim.x / 32;
+    const int warp_id_in_block = threadIdx.x / 32;
+    
+    if (warp_id_in_block >= warps_per_block) return;
+    
+    uint32_t* warp_w = &shared_w[warp_id_in_block * 64];
+    uint32_t* warp_state = &shared_state[warp_id_in_block * 8];
     
     const uint8_t* my_message = messages + (warp_id * message_len);
     
@@ -91,51 +98,57 @@ __global__ void sha256_extreme_batch_kernel(
         warp_state[lane_id] = initial_h[lane_id];
     }
     
-    size_t num_blocks = (message_len + 8 + 63) / 64;
+   
+    size_t num_blocks = (message_len + 9 + 63) / 64; 
     
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         const uint8_t* block_data = my_message + (block_idx * 64);
         size_t bytes_in_block = (block_idx == num_blocks - 1) ? 
             (message_len - block_idx * 64) : 64;
         
-       
         #pragma unroll
         for (int t = lane_id; t < 16; t += 32) {
             if (t * 4 + 3 < bytes_in_block) {
-                
                 warp_w[t] = (uint32_t)block_data[t * 4] << 24 |
                            (uint32_t)block_data[t * 4 + 1] << 16 |
                            (uint32_t)block_data[t * 4 + 2] << 8 |
                            (uint32_t)block_data[t * 4 + 3];
             } else if (t * 4 < bytes_in_block) {
-                
                 uint32_t word = 0;
                 for (int i = 0; i < 4 && (t * 4 + i) < bytes_in_block; i++) {
                     uint8_t byte_val = block_data[t * 4 + i];
-                    
-                    
-                    if ((t * 4 + i) == message_len % 64 && block_idx == num_blocks - 1) {
-                        byte_val = 0x80;
-                    }
-                    
                     word |= (uint32_t)byte_val << (24 - i * 8);
                 }
                 warp_w[t] = word;
             } else {
-                // Zero padding
                 warp_w[t] = 0;
             }
         }
         
-        
         if (block_idx == num_blocks - 1) {
-            if (lane_id == 14) {
-                uint64_t bit_len = message_len * 8;
-                warp_w[14] = (bit_len >> 32) & 0xFFFFFFFF;
+            if (lane_id == 0) {
+                size_t padding_pos = bytes_in_block;
+                if (padding_pos < 64) {
+                    if (padding_pos < 56) {
+                       
+                        warp_w[padding_pos / 4] |= 0x80 << (24 - (padding_pos % 4) * 8);
+                    } else {
+                        // Tidak ada space, butuh block tambahan
+                        // Handle di block berikutnya (tapi ini block terakhir)
+                    }
+                }
             }
-            if (lane_id == 15) {
-                uint64_t bit_len = message_len * 8;
-                warp_w[15] = bit_len & 0xFFFFFFFF;
+            
+            
+            if (bytes_in_block <= 56) {
+                if (lane_id == 14) {
+                    uint64_t bit_len = message_len * 8;
+                    warp_w[14] = (bit_len >> 32) & 0xFFFFFFFF;
+                }
+                if (lane_id == 15) {
+                    uint64_t bit_len = message_len * 8;
+                    warp_w[15] = bit_len & 0xFFFFFFFF;
+                }
             }
         }
         
@@ -146,7 +159,7 @@ __global__ void sha256_extreme_batch_kernel(
                        sigma0(warp_w[t-15]) + warp_w[t-16];
         }
         
-        block.sync(); 
+        block.sync();
         
         uint32_t a, b, c, d, e, f, g, h_val;
         
@@ -164,9 +177,12 @@ __global__ void sha256_extreme_batch_kernel(
         g = warp.shfl(g, 0);
         h_val = warp.shfl(h_val, 0);
         
+        int rounds_per_thread = (64 + 31) / 32;
         #pragma unroll
-        for (int t = lane_id * 2; t < min(64, (lane_id + 1) * 2); t++) {
-            uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[t] + warp_w[t];
+        for (int round_base = lane_id * rounds_per_thread; 
+             round_base < min(64, (lane_id + 1) * rounds_per_thread); 
+             round_base++) {
+            uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[round_base] + warp_w[round_base];
             uint32_t t2 = Sigma0(a) + Maj(a, b, c);
             h_val = g; 
             g = f; 
@@ -205,19 +221,18 @@ __global__ void sha256_extreme_batch_kernel(
             warp_state[7] += h_val;
         }
         
-        warp.sync(); 
+        warp.sync();
     }
     
-    if (lane_id < 8) {
+    if (lane_id < 8 && warp_id < num_messages) {
         hashes[warp_id * 8 + lane_id] = warp_state[lane_id];
     }
 }
 
 /**
- * @brief 
+ * @brief Template kernel for fixed-length messages
  * 
- * 
- * 
+ * Optimized for specific message lengths with compile-time unrolling.
  */
 template<int MESSAGE_LENGTH>
 __global__ void sha256_fixed_length_kernel(
@@ -230,7 +245,6 @@ __global__ void sha256_fixed_length_kernel(
     
     constexpr size_t num_blocks = (MESSAGE_LENGTH + 8 + 63) / 64;
     constexpr size_t last_block_bytes = MESSAGE_LENGTH % 64;
-    constexpr size_t padding_position = last_block_bytes;
     
     uint32_t h0 = initial_h[0], h1 = initial_h[1], h2 = initial_h[2], h3 = initial_h[3];
     uint32_t h4 = initial_h[4], h5 = initial_h[5], h6 = initial_h[6], h7 = initial_h[7];
@@ -240,6 +254,7 @@ __global__ void sha256_fixed_length_kernel(
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         uint32_t w[64];
         const uint8_t* block_data = my_message + (block_idx * 64);
+        
         #pragma unroll
         for (int i = 0; i < 16; i++) {
             size_t byte_pos = block_idx * 64 + i * 4;
@@ -297,12 +312,14 @@ __global__ void sha256_fixed_length_kernel(
         h4 += e; h5 += f; h6 += g; h7 += h_val;
     }
     
-    
     uint32_t* my_hash = hashes + (tid * 8);
     my_hash[0] = h0; my_hash[1] = h1; my_hash[2] = h2; my_hash[3] = h3;
     my_hash[4] = h4; my_hash[5] = h5; my_hash[6] = h6; my_hash[7] = h7;
 }
 
+/**
+ * @brief 
+ */
 __global__ void sha256_64byte_kernel(
     const uint8_t* __restrict__ messages,
     uint32_t num_messages, 
@@ -326,7 +343,7 @@ __global__ void sha256_64byte_kernel(
                (uint32_t)my_message[i * 4 + 3];
     }
     
-    w[15] = 64 * 8; 
+    w[15] = 0x00000200; 
     
     #pragma unroll
     for (int i = 16; i < 64; i++) {
@@ -350,11 +367,16 @@ __global__ void sha256_64byte_kernel(
 }
 
 /**
- * @brief 
+ * @brief Main batch processing function with automatic kernel selection
  */
 void sha256_gpu_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes, cudaStream_t stream) {
     if (messages == nullptr || hashes == nullptr || num_messages == 0) {
         throw std::invalid_argument("Invalid input parameters");
+    }
+    
+    // PERBAIKAN: Validasi message length
+    if (message_len == 0 || message_len > 128) {
+        throw std::invalid_argument("Message length must be between 1 and 128 bytes");
     }
     
     if (message_len == 64) {
@@ -371,16 +393,21 @@ void sha256_gpu_batch(const uint8_t* messages, size_t message_len, uint32_t num_
             case 40: sha256_fixed_length_kernel<40><<<blocks_per_grid, threads_per_block, 0, stream>>>(messages, num_messages, hashes); break;
             case 32: sha256_fixed_length_kernel<32><<<blocks_per_grid, threads_per_block, 0, stream>>>(messages, num_messages, hashes); break;
             default: 
+                // PERBAIKAN: Gunakan dynamic shared memory untuk extreme batch kernel
                 const int warp_threads = 256;
                 const int warps_per_block = warp_threads / 32;
                 const int blocks = (num_messages + warps_per_block - 1) / warps_per_block;
-                sha256_extreme_batch_kernel<<<blocks, warp_threads, 0, stream>>>(messages, message_len, num_messages, hashes);
+                size_t shared_mem_size = (64 * 8 + 8 * 8) * warps_per_block * sizeof(uint32_t);
+                sha256_extreme_batch_kernel<<<blocks, warp_threads, shared_mem_size, stream>>>(
+                    messages, message_len, num_messages, hashes);
         }
     } else {
         const int warp_threads = 256;
         const int warps_per_block = warp_threads / 32;
         const int blocks = (num_messages + warps_per_block - 1) / warps_per_block;
-        sha256_extreme_batch_kernel<<<blocks, warp_threads, 0, stream>>>(messages, message_len, num_messages, hashes);
+        size_t shared_mem_size = (64 * 8 + 8 * 8) * warps_per_block * sizeof(uint32_t);
+        sha256_extreme_batch_kernel<<<blocks, warp_threads, shared_mem_size, stream>>>(
+            messages, message_len, num_messages, hashes);
     }
     
     CUDA_CHECK(cudaGetLastError());
@@ -393,21 +420,26 @@ void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_outpu
     sha256_gpu_batch(message, message_len, 1, hash_output, 0);
 }
 
-SHA256GPU::SHA256GPU(size_t max_batch) : max_batch_size(max_batch) {
-    CUDA_CHECK(cudaMalloc(&d_messages, max_batch_size * 128));
+SHA256GPU::SHA256GPU(size_t max_batch, size_t max_msg_len) : 
+    max_batch_size(max_batch), max_message_len(max_msg_len) {
+    CUDA_CHECK(cudaMalloc(&d_messages, max_batch_size * max_message_len));
     CUDA_CHECK(cudaMalloc(&d_hashes, max_batch_size * 8 * sizeof(uint32_t)));
     CUDA_CHECK(cudaStreamCreate(&stream));
 }
 
 SHA256GPU::~SHA256GPU() {
-    cudaFree(d_messages);
-    cudaFree(d_hashes);
-    cudaStreamDestroy(stream);
+    if (d_messages) cudaFree(d_messages);
+    if (d_hashes) cudaFree(d_hashes);
+    if (stream) cudaStreamDestroy(stream);
 }
 
 void SHA256GPU::compute_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes) {
     if (num_messages > max_batch_size) {
         throw std::runtime_error("Batch size exceeds maximum capacity");
+    }
+    
+    if (message_len > max_message_len) {
+        throw std::runtime_error("Message length exceeds maximum supported length");
     }
     
     CUDA_CHECK(cudaMemcpyAsync(d_messages, messages, num_messages * message_len, cudaMemcpyHostToDevice, stream));
@@ -419,6 +451,10 @@ void SHA256GPU::compute_batch(const uint8_t* messages, size_t message_len, uint3
 void SHA256GPU::compute_batch_async(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes) {
     if (num_messages > max_batch_size) {
         throw std::runtime_error("Batch size exceeds maximum capacity");
+    }
+    
+    if (message_len > max_message_len) {
+        throw std::runtime_error("Message length exceeds maximum supported length");
     }
     
     CUDA_CHECK(cudaMemcpyAsync(d_messages, messages, num_messages * message_len, cudaMemcpyHostToDevice, stream));

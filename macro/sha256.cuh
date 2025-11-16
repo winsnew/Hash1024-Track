@@ -5,15 +5,10 @@
 #include <cuda_runtime.h>
 
 /**
- * @brief 
+ * @brief GPU-accelerated SHA256 implementation
  * 
- * 
- * 
- * 
- * 
- * 
- * 
- * 
+ * This library provides high-performance SHA256 hashing using CUDA
+ * with support for both single messages and batch processing.
  */
 
 void sha256_gpu_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes, cudaStream_t stream = 0);
@@ -24,10 +19,11 @@ private:
     uint8_t* d_messages;
     uint32_t* d_hashes;
     size_t max_batch_size;
+    size_t max_message_len;
     cudaStream_t stream;
 
 public:
-    SHA256GPU(size_t max_batch = 1000000);
+    SHA256GPU(size_t max_batch = 1000000, size_t max_msg_len = 128);
     ~SHA256GPU();
     
     void compute_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes);
