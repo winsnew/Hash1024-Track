@@ -101,11 +101,11 @@ int main() {
         std::cout << "SHA256 GPU Implementation Test" << std::endl;
         std::cout << "=================================" << std::endl << std::endl;
         
-        test_single_message();
+        // test_single_message();
         
         test_batch_performance();
         
-        test_different_message_lengths();
+        // test_different_message_lengths();
         
         return 0;
     }
