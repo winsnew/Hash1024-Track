@@ -2,6 +2,8 @@
 #include <chrono>
 #include <random>
 #include <iomanip>
+#include <cstdint>
+#include <cstring>
 
 class Benchmark {
 public:
