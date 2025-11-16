@@ -101,7 +101,7 @@ int main() {
         std::cout << "SHA256 GPU Implementation Test" << std::endl;
         std::cout << "=================================" << std::endl << std::endl;
         
-        // test_single_message();
+        test_single_message();
         
         test_batch_performance();
         
