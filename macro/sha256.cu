@@ -99,7 +99,7 @@ __global__ void sha256_extreme_batch_kernel(
     }
     
    
-    size_t num_blocks = (message_len + 9 + 63) / 64; 
+    size_t num_blocks = (message_len + 8 + 63) / 64; 
     
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         const uint8_t* block_data = my_message + (block_idx * 64);
