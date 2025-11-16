@@ -14,13 +14,25 @@
  * 
  * 
  * 
- * 
- * 
- * 
- * 
- * 
- * 
  */
+
+void sha256_gpu_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes, cudaStream_t stream = 0);
 void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_output);
+
+class SHA256GPU {
+private:
+    uint8_t* d_messages;
+    uint32_t* d_hashes;
+    size_t max_batch_size;
+    cudaStream_t stream;
+
+public:
+    SHA256GPU(size_t max_batch = 1000000);
+    ~SHA256GPU();
+    
+    void compute_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes);
+    void compute_batch_async(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes);
+    void synchronize();
+};
 
 #endif // SHA256_CUH

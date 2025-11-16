@@ -2,8 +2,11 @@
 #include <iostream>
 #include <vector>
 #include <stdexcept>
-#include <cstring> 
+#include <cstring>
+#include <cooperative_groups.h>
+#include <cuda_occupancy.h>
 
+namespace cg = cooperative_groups;
 
 #define CUDA_CHECK(err) { \
     cudaError_t error = err; \
@@ -13,7 +16,33 @@
     } \
 }
 
-#define ROTR(a,b) (((a) >> (b)) | ((a) << (32-(b))))
+__forceinline__ __device__ uint32_t ROTR(uint32_t a, uint32_t b) {
+    return __funnelshift_r(a, a, b);
+}
+
+__forceinline__ __device__ uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) ^ (~x & z);
+}
+
+__forceinline__ __device__ uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) ^ (x & z) ^ (y & z);
+}
+
+__forceinline__ __device__ uint32_t Sigma0(uint32_t x) {
+    return ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22);
+}
+
+__forceinline__ __device__ uint32_t Sigma1(uint32_t x) {
+    return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25);
+}
+
+__forceinline__ __device__ uint32_t sigma0(uint32_t x) {
+    return ROTR(x, 7) ^ ROTR(x, 18) ^ (x >> 3);
+}
+
+__forceinline__ __device__ uint32_t sigma1(uint32_t x) {
+    return ROTR(x, 17) ^ ROTR(x, 19) ^ (x >> 10);
+}
 
 __constant__ uint32_t k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -31,95 +60,293 @@ __constant__ uint32_t initial_h[8] = {
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-__device__ uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
-__device__ uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
-__device__ uint32_t Sigma0(uint32_t x) { return ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22); }
-__device__ uint32_t Sigma1(uint32_t x) { return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25); }
-__device__ uint32_t sigma0(uint32_t x) { return ROTR(x, 7) ^ ROTR(x, 18) ^ (x >> 3); }
-__device__ uint32_t sigma1(uint32_t x) { return ROTR(x, 17) ^ ROTR(x, 19) ^ (x >> 10); }
-
 /**
  * @brief 
  * 
  * 
  * 
- * 
- * @param data_chunk 
- * @param current_hash_state 
  */
-__global__ void sha256_gpu_kernel_compression(const uint8_t* __restrict__ data_chunk, uint32_t* __restrict__ current_hash_state) {
-    uint32_t w[64];
+__global__ void sha256_extreme_batch_kernel(
+    const uint8_t* __restrict__ messages, 
+    size_t message_len,
+    uint32_t num_messages, 
+    uint32_t* __restrict__ hashes) {
     
-    #pragma unroll
-    for (int t = 0; t < 16; ++t) {
-        w[t] = (uint32_t)data_chunk[t * 4] << 24 |
-               (uint32_t)data_chunk[t * 4 + 1] << 16 |
-               (uint32_t)data_chunk[t * 4 + 2] << 8 |
-               (uint32_t)data_chunk[t * 4 + 3];
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int lane_id = threadIdx.x % 32;
+    
+    if (warp_id >= num_messages) return;
+    
+    __shared__ uint32_t shared_w[64 * 32]; 
+    __shared__ uint32_t shared_state[8 * 32]; 
+    
+    uint32_t* warp_w = &shared_w[warp_id * 64];
+    uint32_t* warp_state = &shared_state[warp_id * 8];
+    
+    const uint8_t* my_message = messages + (warp_id * message_len);
+    
+    if (lane_id < 8) {
+        warp_state[lane_id] = initial_h[lane_id];
     }
     
-    #pragma unroll
-    for (int t = 16; t < 64; ++t) {
-        w[t] = sigma1(w[t - 2]) + w[t - 7] + sigma0(w[t - 15]) + w[t - 16];
+    size_t num_blocks = (message_len + 8 + 63) / 64;
+    
+    for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+        const uint8_t* block_data = my_message + (block_idx * 64);
+        size_t bytes_in_block = (block_idx == num_blocks - 1) ? 
+            (message_len - block_idx * 64) : 64;
+        
+        #pragma unroll
+        for (int t = lane_id; t < 16; t += 32) {
+            if (t * 4 + 3 < bytes_in_block) {
+                warp_w[t] = (uint32_t)block_data[t * 4] << 24 |
+                           (uint32_t)block_data[t * 4 + 1] << 16 |
+                           (uint32_t)block_data[t * 4 + 2] << 8 |
+                           (uint32_t)block_data[t * 4 + 3];
+            } else if (t * 4 < bytes_in_block) {
+                uint32_t word = 0;
+                for (int i = 0; i < 4 && (t * 4 + i) < bytes_in_block; i++) {
+                    if ((t * 4 + i) == bytes_in_block - 1 && block_idx == num_blocks - 1) {
+                        word |= 0x80 << (24 - i * 8); 
+                    } else {
+                        word |= (uint32_t)block_data[t * 4 + i] << (24 - i * 8);
+                    }
+                }
+                
+                if (block_idx == num_blocks - 1 && t == 15) {
+                    uint64_t bit_len = message_len * 8;
+                    word = (bit_len >> 32) & 0xFFFFFFFF; 
+                } else if (block_idx == num_blocks - 1 && t == 14) {
+                    uint64_t bit_len = message_len * 8;
+                    word = bit_len & 0xFFFFFFFF; 
+                }
+                
+                warp_w[t] = word;
+            } else {
+                warp_w[t] = 0;
+            }
+        }
+        
+        #pragma unroll
+        for (int t = 16 + lane_id; t < 64; t += 32) {
+            warp_w[t] = sigma1(warp_w[t-2]) + warp_w[t-7] + 
+                       sigma0(warp_w[t-15]) + warp_w[t-16];
+        }
+        
+        block.sync(); 
+        
+        
+        uint32_t a, b, c, d, e, f, g, h_val;
+        
+        if (lane_id == 0) {
+            a = warp_state[0]; b = warp_state[1]; c = warp_state[2]; d = warp_state[3];
+            e = warp_state[4]; f = warp_state[5]; g = warp_state[6]; h_val = warp_state[7];
+        }
+        
+        a = warp.shfl(a, 0);
+        b = warp.shfl(b, 0);
+        c = warp.shfl(c, 0);
+        d = warp.shfl(d, 0);
+        e = warp.shfl(e, 0);
+        f = warp.shfl(f, 0);
+        g = warp.shfl(g, 0);
+        h_val = warp.shfl(h_val, 0);
+        
+        // Parallel round computation 
+        #pragma unroll
+        for (int t = lane_id * 2; t < min(64, (lane_id + 1) * 2); t++) {
+            uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[t] + warp_w[t];
+            uint32_t t2 = Sigma0(a) + Maj(a, b, c);
+            h_val = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        
+        for (int offset = 16; offset > 0; offset /= 2) {
+            uint32_t a_temp = warp.shfl_down(a, offset);
+            uint32_t b_temp = warp.shfl_down(b, offset);
+            uint32_t c_temp = warp.shfl_down(c, offset);
+            uint32_t d_temp = warp.shfl_down(d, offset);
+            uint32_t e_temp = warp.shfl_down(e, offset);
+            uint32_t f_temp = warp.shfl_down(f, offset);
+            uint32_t g_temp = warp.shfl_down(g, offset);
+            uint32_t h_temp = warp.shfl_down(h_val, offset);
+            
+            if (lane_id < offset) {
+                a += a_temp; b += b_temp; c += c_temp; d += d_temp;
+                e += e_temp; f += f_temp; g += g_temp; h_val += h_temp;
+            }
+        }
+        
+        
+        if (lane_id == 0) {
+            warp_state[0] += a; warp_state[1] += b;
+            warp_state[2] += c; warp_state[3] += d;
+            warp_state[4] += e; warp_state[5] += f;
+            warp_state[6] += g; warp_state[7] += h_val;
+        }
+        
+        warp.sync();
     }
-
-    uint32_t a = current_hash_state[0], b = current_hash_state[1], c = current_hash_state[2], d = current_hash_state[3];
-    uint32_t e = current_hash_state[4], f = current_hash_state[5], g = current_hash_state[6], h_val = current_hash_state[7];
-
-    #pragma unroll
-    for (int t = 0; t < 64; ++t) {
-        uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[t] + w[t];
-        uint32_t t2 = Sigma0(a) + Maj(a, b, c);
-
-        uint32_t old_a = a, old_b = b, old_c = c, old_d = d;
-        uint32_t old_e = e, old_f = f, old_g = g;
-
-        h_val = old_g;
-        g = old_f;
-        f = old_e;
-        e = old_d + t1;
-        d = old_c;
-        c = old_b;
-        b = old_a;
-        a = t1 + t2;
+    
+    if (lane_id < 8) {
+        hashes[warp_id * 8 + lane_id] = warp_state[lane_id];
     }
+}
 
-    current_hash_state[0] += a; current_hash_state[1] += b;
-    current_hash_state[2] += c; current_hash_state[3] += d;
-    current_hash_state[4] += e; current_hash_state[5] += f;
-    current_hash_state[6] += g; current_hash_state[7] += h_val;
+/**
+ * @brief 
+ * 
+ * 
+ */
+template<int MESSAGE_LENGTH>
+__global__ void sha256_fixed_length_kernel(
+    const uint8_t* __restrict__ messages,
+    uint32_t num_messages, 
+    uint32_t* __restrict__ hashes) {
+    
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_messages) return;
+    
+    constexpr size_t num_blocks = (MESSAGE_LENGTH + 8 + 63) / 64;
+    
+    uint32_t h0 = initial_h[0], h1 = initial_h[1], h2 = initial_h[2], h3 = initial_h[3];
+    uint32_t h4 = initial_h[4], h5 = initial_h[5], h6 = initial_h[6], h7 = initial_h[7];
+    
+    const uint8_t* my_message = messages + (tid * MESSAGE_LENGTH);
+    
+    for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+        uint32_t w[64];
+        const uint8_t* block_data = my_message + (block_idx * 64);
+        
+        
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            if constexpr (block_idx * 64 + i * 4 + 3 < MESSAGE_LENGTH) {
+                w[i] = (uint32_t)block_data[i * 4] << 24 |
+                       (uint32_t)block_data[i * 4 + 1] << 16 |
+                       (uint32_t)block_data[i * 4 + 2] << 8 |
+                       (uint32_t)block_data[i * 4 + 3];
+            } else {
+                
+                w[i] = 0;
+            }
+        }
+        
+        // Last block padding
+        if constexpr (block_idx == num_blocks - 1) {
+            size_t padding_byte = MESSAGE_LENGTH % 64;
+            if (padding_byte < 60) {
+                w[padding_byte / 4] |= 0x80 << (24 - (padding_byte % 4) * 8);
+            }
+            
+            
+            w[14] = (MESSAGE_LENGTH * 8) >> 32;
+            w[15] = MESSAGE_LENGTH * 8;
+        }
+        
+        #pragma unroll
+        for (int i = 16; i < 64; i++) {
+            w[i] = sigma1(w[i-2]) + w[i-7] + sigma0(w[i-15]) + w[i-16];
+        }
+        
+        uint32_t a = h0, b = h1, c = h2, d = h3;
+        uint32_t e = h4, f = h5, g = h6, h_val = h7;
+        
+        #pragma unroll
+        for (int i = 0; i < 64; i++) {
+            uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[i] + w[i];
+            uint32_t t2 = Sigma0(a) + Maj(a, b, c);
+            h_val = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        
+        h0 += a; h1 += b; h2 += c; h3 += d;
+        h4 += e; h5 += f; h6 += g; h7 += h_val;
+    }
+    
+    uint32_t* my_hash = hashes + (tid * 8);
+    my_hash[0] = h0; my_hash[1] = h1; my_hash[2] = h2; my_hash[3] = h3;
+    my_hash[4] = h4; my_hash[5] = h5; my_hash[6] = h6; my_hash[7] = h7;
+}
+
+
+void sha256_gpu_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes, cudaStream_t stream) {
+    if (messages == nullptr || hashes == nullptr || num_messages == 0) {
+        throw std::invalid_argument("Invalid input parameters");
+    }
+    
+    if (message_len <= 64) {
+        const int threads_per_block = 256;
+        const int blocks_per_grid = (num_messages + threads_per_block - 1) / threads_per_block;
+        
+        switch (message_len) {
+            case 64: sha256_fixed_length_kernel<64><<<blocks_per_grid, threads_per_block, 0, stream>>>(messages, num_messages, hashes); break;
+            case 56: sha256_fixed_length_kernel<56><<<blocks_per_grid, threads_per_block, 0, stream>>>(messages, num_messages, hashes); break;
+            case 40: sha256_fixed_length_kernel<40><<<blocks_per_grid, threads_per_block, 0, stream>>>(messages, num_messages, hashes); break;
+            case 32: sha256_fixed_length_kernel<32><<<blocks_per_grid, threads_per_block, 0, stream>>>(messages, num_messages, hashes); break;
+            default: 
+                const int warp_threads = 256;
+                const int warps_per_block = warp_threads / 32;
+                const int blocks = (num_messages + warps_per_block - 1) / warps_per_block;
+                sha256_extreme_batch_kernel<<<blocks, warp_threads, 0, stream>>>(messages, message_len, num_messages, hashes);
+        }
+    } else {
+        const int warp_threads = 256;
+        const int warps_per_block = warp_threads / 32;
+        const int blocks = (num_messages + warps_per_block - 1) / warps_per_block;
+        
+        sha256_extreme_batch_kernel<<<blocks, warp_threads, 0, stream>>>(messages, message_len, num_messages, hashes);
+    }
+    
+    CUDA_CHECK(cudaGetLastError());
+    if (stream == 0) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 }
 
 void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_output) {
-    if (message == nullptr || hash_output == nullptr) {
-        throw std::invalid_argument("Input pointers cannot be null.");
+    sha256_gpu_batch(message, message_len, 1, hash_output, 0);
+}
+
+SHA256GPU::SHA256GPU(size_t max_batch) : max_batch_size(max_batch) {
+    CUDA_CHECK(cudaMalloc(&d_messages, max_batch_size * 64)); 
+    CUDA_CHECK(cudaMalloc(&d_hashes, max_batch_size * 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaStreamCreate(&stream));
+}
+
+SHA256GPU::~SHA256GPU() {
+    cudaFree(d_messages);
+    cudaFree(d_hashes);
+    cudaStreamDestroy(stream);
+}
+
+void SHA256GPU::compute_batch(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes) {
+    if (num_messages > max_batch_size) {
+        throw std::runtime_error("Batch size exceeds maximum capacity");
     }
+    
+    CUDA_CHECK(cudaMemcpyAsync(d_messages, messages, num_messages * message_len, cudaMemcpyHostToDevice, stream));
+    
+    sha256_gpu_batch(d_messages, message_len, num_messages, d_hashes, stream);
+    
+    CUDA_CHECK(cudaMemcpyAsync(hashes, d_hashes, num_messages * 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
 
-    size_t num_blocks = (message_len + 1 + 8 + 63) / 64;
-    std::vector<uint8_t> padded_message(num_blocks * 64, 0);
-    memcpy(padded_message.data(), message, message_len);
-    padded_message[message_len] = 0x80;
-
-    uint64_t message_len_bits = (uint64_t)message_len * 8;
-    for (int i = 0; i < 8; ++i) {
-        padded_message[num_blocks * 64 - 8 + i] = (message_len_bits >> (56 - 8 * i)) & 0xFF;
+void SHA256GPU::compute_batch_async(const uint8_t* messages, size_t message_len, uint32_t num_messages, uint32_t* hashes) {
+    if (num_messages > max_batch_size) {
+        throw std::runtime_error("Batch size exceeds maximum capacity");
     }
+    
+    CUDA_CHECK(cudaMemcpyAsync(d_messages, messages, num_messages * message_len, cudaMemcpyHostToDevice, stream));
+    sha256_gpu_batch(d_messages, message_len, num_messages, d_hashes, stream);
+    CUDA_CHECK(cudaMemcpyAsync(hashes, d_hashes, num_messages * 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+}
 
-    uint8_t* d_chunk;
-    uint32_t* d_hash_state;
-    CUDA_CHECK(cudaMalloc(&d_chunk, 64 * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_hash_state, 8 * sizeof(uint32_t)));
-
-    CUDA_CHECK(cudaMemcpy(d_hash_state, initial_h, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
-
-    for (size_t i = 0; i < num_blocks; ++i) {
-        CUDA_CHECK(cudaMemcpy(d_chunk, &padded_message[i * 64], 64 * sizeof(uint8_t), cudaMemcpyHostToDevice));
-        sha256_gpu_kernel_compression<<<1, 1>>>(d_chunk, d_hash_state);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    CUDA_CHECK(cudaMemcpy(hash_output, d_hash_state, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_chunk));
-    CUDA_CHECK(cudaFree(d_hash_state));
+void SHA256GPU::synchronize() {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
