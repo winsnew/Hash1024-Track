@@ -70,8 +70,18 @@ __global__ void sha256_gpu_kernel_compression(const uint8_t* __restrict__ data_c
     for (int t = 0; t < 64; ++t) {
         uint32_t t1 = h_val + Sigma1(e) + Ch(e, f, g) + k[t] + w[t];
         uint32_t t2 = Sigma0(a) + Maj(a, b, c);
-        h_val = g; g = f; f = e; e = d + t1;
-        d = c; c = b; b = a; a = t1 + t2;
+
+        uint32_t old_a = a, old_b = b, old_c = c, old_d = d;
+        uint32_t old_e = e, old_f = f, old_g = g;
+
+        h_val = old_g;
+        g = old_f;
+        f = old_e;
+        e = old_d + t1;
+        d = old_c;
+        c = old_b;
+        b = old_a;
+        a = t1 + t2;
     }
 
     current_hash_state[0] += a; current_hash_state[1] += b;
@@ -85,7 +95,7 @@ void sha256_gpu(const uint8_t* message, size_t message_len, uint32_t* hash_outpu
         throw std::invalid_argument("Input pointers cannot be null.");
     }
 
-    size_t num_blocks = (message_len + 8 + 63) / 64;
+    size_t num_blocks = (message_len + 1 + 8 + 63) / 64;
     std::vector<uint8_t> padded_message(num_blocks * 64, 0);
     memcpy(padded_message.data(), message, message_len);
     padded_message[message_len] = 0x80;
