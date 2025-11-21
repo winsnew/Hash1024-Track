@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package cuda_example;
+
+message VectorData {
+    repeated float values = 1;
+    int32 size = 2;
+}
+
+message MatrixData {
+    repeated float elements = 1;
+    int32 rows = 2;
+    int32 cols = 3;
+}
+
+message ComputationResult {
+    float result = 1;
+    VectorData processed_vector = 2;
+    double computation_time = 3;
+}
